@@ -11,7 +11,19 @@
 #include "estimator.h"
 #include "parameters.h"
 #include "utility/visualization.h"
+#include "lvio_ros_msgs/CorrectData.h"
+#include "lvio_ros_msgs/PointCloud3.h"
+#include "lvio_ros_msgs/Td.h"
 
+typedef std::vector<std::pair<std::vector<sensor_msgs::ImuConstPtr>, sensor_msgs::PointCloudConstPtr>> VinsData;
+const int ENOUGH_COUNT = 5;
+const double TD_ERROR_THRES = 0.002;
+
+ros::Publisher pub_correct_data;
+ros::Publisher pub_vision_local_cloud;
+ros::Publisher pub_img_td;
+ros::Publisher pub_gravity;
+// ros::Publisher pub_imgs;
 
 Estimator estimator;
 
@@ -30,6 +42,8 @@ std::mutex m_estimator;
 std::mutex m_odom;
 
 double latest_time;
+double last_td = 0;
+int td_count = 0;
 Eigen::Vector3d tmp_P;
 Eigen::Quaterniond tmp_Q;
 Eigen::Vector3d tmp_V;
@@ -94,6 +108,80 @@ void update()
     queue<sensor_msgs::ImuConstPtr> tmp_imu_buf = imu_buf;
     for (sensor_msgs::ImuConstPtr tmp_imu_msg; !tmp_imu_buf.empty(); tmp_imu_buf.pop())
         predict(tmp_imu_buf.front());
+}
+
+void storeCorrectData(const Estimator &estimator, const std_msgs::Header &header, lvio_ros_msgs::CorrectData &correct_data)
+{
+    correct_data.header = header;
+
+    Quaterniond _tmp_Q;
+    _tmp_Q = Quaterniond(estimator.Rs[WINDOW_SIZE]);
+    correct_data.orientation.x = _tmp_Q.x();
+    correct_data.orientation.y = _tmp_Q.y();
+    correct_data.orientation.z = _tmp_Q.z();
+    correct_data.orientation.w = _tmp_Q.w();
+
+    correct_data.position.x = estimator.Ps[WINDOW_SIZE].x();
+    correct_data.position.y = estimator.Ps[WINDOW_SIZE].y();
+    correct_data.position.z = estimator.Ps[WINDOW_SIZE].z();
+
+    correct_data.velocity.x = estimator.Vs[WINDOW_SIZE].x();
+    correct_data.velocity.y = estimator.Vs[WINDOW_SIZE].y();
+    correct_data.velocity.z = estimator.Vs[WINDOW_SIZE].z();
+
+    correct_data.bias_acc.x = estimator.Bas[WINDOW_SIZE].x();
+    correct_data.bias_acc.y = estimator.Bas[WINDOW_SIZE].y();
+    correct_data.bias_acc.z = estimator.Bas[WINDOW_SIZE].z();
+
+    correct_data.bias_gyro.x = estimator.Bgs[WINDOW_SIZE].x();
+    correct_data.bias_gyro.y = estimator.Bgs[WINDOW_SIZE].y();
+    correct_data.bias_gyro.z = estimator.Bgs[WINDOW_SIZE].z();
+}
+
+// double last_time = 0;
+void storeFeatureCloud(const Estimator &estimator, const std_msgs::Header &header, sensor_msgs::PointCloud &feature_cloud)
+{
+    feature_cloud.header = header; //window.back.header
+    // double delta_t = point_cloud.header.stamp.toSec() - last_time;
+    // last_time = point_cloud.header.stamp.toSec();
+    // ROS_INFO("delta_t is %f",delta_t);
+    // if (delta_t > 0.06)
+    // ROS_WARN("img frame lost!!!!");
+
+    sensor_msgs::ChannelFloat32 p_2d;
+    for (auto &it_per_id : estimator.f_manager.feature)
+    {
+        int used_num;
+        used_num = it_per_id.feature_per_frame.size();
+        if (!(used_num >= 2 && it_per_id.start_frame < WINDOW_SIZE - 2 && it_per_id.solve_flag == 1))
+            continue;
+
+        // recover real depth at "current camera frame"==>start frame
+        int imu_i = it_per_id.start_frame;
+        Vector3d pts_i = it_per_id.feature_per_frame[0].point * it_per_id.estimated_depth;
+        Vector3d w_pts_i = estimator.Rs[imu_i] * (estimator.ric[0] * pts_i + estimator.tic[0]) + estimator.Ps[imu_i]; // frome camera frame to world frame
+        geometry_msgs::Point32 p;
+        p.x = w_pts_i(0);
+        p.y = w_pts_i(1);
+        p.z = w_pts_i(2);
+        feature_cloud.points.push_back(p);
+        p_2d.values.push_back(it_per_id.feature_id);
+    }
+    feature_cloud.channels.push_back(p_2d);
+}
+
+void storeImageTd(const Estimator &estimator, const sensor_msgs::PointCloudConstPtr &img_msg, lvio_ros_msgs::Td &img_td)
+{
+    img_td.header = img_msg->header;
+    img_td.cur_td = estimator.td;
+}
+
+void storeGravity(const Estimator &estimator, const std_msgs::Header &header, geometry_msgs::PointStamped &gravity)
+{
+    gravity.header = header;
+    gravity.point.x = estimator.g.x();
+    gravity.point.y = estimator.g.y();
+    gravity.point.z = estimator.g.z();
 }
 
 std::vector<std::pair<std::vector<sensor_msgs::ImuConstPtr>, sensor_msgs::PointCloudConstPtr>>
@@ -304,6 +392,40 @@ void process()
             pubPointCloud(estimator, header);
             pubTF(estimator, header);
             pubKeyframe(estimator);
+
+            // Check td stablility to decide whether publish VINS data
+            if (estimator.solver_flag == Estimator::SolverFlag::NON_LINEAR)
+            {
+                double td_error = estimator.td - last_td;
+                if (fabs(td_error) <= TD_ERROR_THRES)
+                    td_count++;
+                else
+                    td_count = 0;
+                last_td = estimator.td;
+                ROS_INFO_STREAM("estimate td:" << estimator.td);
+            }
+            if (!estimator.donot_send && td_count > ENOUGH_COUNT)
+            {
+                // Only publish the solved state at 20Hz
+                lvio_ros_msgs::CorrectData correct_data;
+                sensor_msgs::PointCloud feature_cloud;
+                lvio_ros_msgs::Td img_td;
+                geometry_msgs::PointStamped gravity;
+                storeCorrectData(estimator, header, correct_data); // pose, velocity, bias for lvio
+                storeFeatureCloud(estimator, header, feature_cloud); // vision feature cloud for lvio
+                storeImageTd(estimator, img_msg, img_td);            // send td for lvio img
+                storeGravity(estimator, header, gravity);
+                pub_correct_data.publish(correct_data);
+                pub_vision_local_cloud.publish(feature_cloud);       // different content from keyframe cloud!
+                pub_img_td.publish(img_td);
+                pub_gravity.publish(gravity);
+                // ROS_DEBUG("VINS: %fms", t_vins.toc());
+            }
+            else
+            {
+                ROS_INFO("Need to wait !!!");
+                estimator.donot_send = 0; // Maybe send msg at next time
+            }
         }
         m_estimator.unlock();
 
@@ -321,7 +443,7 @@ int main(int argc, char **argv)
     ros::init(argc, argv, "vins");
     ros::NodeHandle n;
     ROS_INFO("\033[1;32m----> Visual Odometry Estimator Started.\033[0m");
-    ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME, ros::console::levels::Warn);
+    ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME, ros::console::levels::Info);
 
     readParameters(n);
     estimator.setParameter();
@@ -334,6 +456,12 @@ int main(int argc, char **argv)
     ros::Subscriber sub_odom    = n.subscribe("odometry/imu", 5000, odom_callback);
     ros::Subscriber sub_image   = n.subscribe(PROJECT_NAME + "/vins/feature/feature", 1, feature_callback);
     ros::Subscriber sub_restart = n.subscribe(PROJECT_NAME + "/vins/feature/restart", 1, restart_callback);
+    // publish vins data for lvio_estimator
+    pub_correct_data = n.advertise<lvio_ros_msgs::CorrectData>(PROJECT_NAME + "/vins/odometry/correct_data", 1000);
+    pub_vision_local_cloud = n.advertise<sensor_msgs::PointCloud>(PROJECT_NAME + "/vins/odometry/vision_local_cloud", 1000);
+    pub_img_td = n.advertise<lvio_ros_msgs::Td>(PROJECT_NAME + "/vins/odometry/td", 1000);
+    pub_gravity = n.advertise<geometry_msgs::PointStamped>(PROJECT_NAME + "/vins/odometry/gravity", 1000);
+    // pub_imgs = n.advertise<lvio_ros_msgs::PointCloud3>("feature", 100);
     if (!USE_LIDAR)
         sub_odom.shutdown();
 
