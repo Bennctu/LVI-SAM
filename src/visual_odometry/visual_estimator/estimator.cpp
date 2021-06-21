@@ -192,6 +192,7 @@ void Estimator::processImage(const map<int, vector<pair<int, Eigen::Matrix<doubl
         {
             ROS_ERROR("VINS failure detection!");
             failure_occur = 1;
+            donot_send = 1;
             clearState();
             setParameter();
             ROS_ERROR("VINS system reboot!");

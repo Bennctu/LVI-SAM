@@ -4,8 +4,8 @@ PROJECT_NAME: "lvi_sam"
 lvi_sam:
 
   # Topics
-  pointCloudTopic: "/points_raw"               # Point cloud data
-  imuTopic: "/imu_raw"                         # IMU data
+  pointCloudTopic: "/velodyne_points"               # Point cloud data
+  imuTopic: "/dji_sdk/imu"                         # IMU data
 
   # Heading
   useImuHeadingInitialization: true          # if using GPS data, set to "true"
@@ -28,9 +28,9 @@ lvi_sam:
   imuGravity: 9.80511
   
   # Extrinsics (lidar -> IMU)
-  extrinsicTrans: [0.0, 0.0, 0.0]
-  extrinsicRot: [-1, 0, 0, 0, 1, 0, 0, 0, -1]
-  extrinsicRPY: [0, 1, 0, -1, 0, 0, 0, 0, 1]
+  extrinsicTrans: [0.0, 0.07, -0.108]
+  extrinsicRot: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+  extrinsicRPY: [0, 1, 0, 1, 0, 0, 0, 0, 1]
 
   # LOAM feature threshold
   edgeThreshold: 1.0
